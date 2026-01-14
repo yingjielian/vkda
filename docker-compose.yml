@@ -1,0 +1,28 @@
+version: '3'
+services:
+  api:
+    build: .
+    hostname: "api"
+    ports:
+      - "8080:8080"
+    environment:
+      MODE: "api"
+      # removes default stdout/stderr buffering behavior in non-terminal apps (such as flask).
+      # This makes print() behave as expected in a development context.
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./api:/app/api
+      - ./common:/app/common
+  camera:
+    build: .
+    environment:
+      MODE: "camera"
+      API_BASE_URL: "http://api:8080"
+      # removes default stdout/stderr buffering behavior in non-terminal apps (such as flask)
+      # This makes print() behave as expected in a development context.
+      PYTHONUNBUFFERED: 1
+    volumes:
+      - ./camera:/app/camera
+      - ./common:/app/common
+    depends_on:
+      - "api"
