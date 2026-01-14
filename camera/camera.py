@@ -101,35 +101,44 @@ class Camera:
         """
         Responds to the API's command to send logs.
         """
+        cmd = command.get("command")
+        if cmd != "send_logs":
+            # noop or unknown command
+            return
+
+        request_id = command.get("requestId")
         start_timestamp = command.get("startTimestamp")
         end_timestamp = command.get("endTimestamp")
-        try:
-            logs = list(filter(
-                lambda x: (
-                    x["timestamp"] >= start_timestamp
-                    and x["timestamp"] <= end_timestamp
-                ),
-                self._logs
-            ))
-        except Exception as e:
-            logger.error(
-                "Camera error on filter logs: %s.  Did you specify start and end timestamps?",
-                str(e)
-            )
+
+        if request_id is None:
+            logger.error("Missing requestId in command")
             return
-        
+        if start_timestamp is None or end_timestamp is None:
+            logger.error("Missing startTimestamp/endTimestamp in command")
+            return
+
+        # Filter logs safely (under lock to avoid concurrent mutation while filtering)
+        with self._log_lock:
+            logs = list(
+                filter(
+                    lambda x: (x["timestamp"] >= start_timestamp and x["timestamp"] <= end_timestamp),
+                    self._logs,
+                )
+            )
+
         logger.debug(
-            "Responding to command.  Logs between %f and %f: %s",
+            "Responding to command %s. Logs between %f and %f: %s",
+            request_id,
             start_timestamp,
             end_timestamp,
-            logs            
+            logs
         )
         resp = requests.post(
             f"{_API_BASE_URL}/send_logs",
-            json={"logs": logs}
+            json={"requestId": request_id, "logs": logs}
         )
         resp.raise_for_status()
-    
+
     def run(self):
         """
         Runs camera in an infinite loop, generating logs and waiting for
@@ -137,25 +146,19 @@ class Camera:
         """
         self._generate_logs_thread = Thread(target=self._generate_logs)
         self._generate_logs_thread.start()
+
         while True:
             try:
                 command = self._poll_for_command()
             except Exception as e:
-                logger.error(
-                    "Camera error on wait for command request attempt: %s",
-                    str(e)
-                )
+                logger.error("Camera error on wait for command request attempt: %s", str(e))
                 continue
-            
+
             try:
                 self._respond_to_command(command)
             except Exception as e:
-                logger.error(
-                    "Camera error on command response: %s",
-                    str(e)
-                )
-            # TODO: DELETE THIS sleep CALL - IT'S ONLY HERE TO PREVENT A HOT LOOP
-            time.sleep(1.0)
+                logger.error("Camera error on command response: %s", str(e))
+
 
 
 def main():

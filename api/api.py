@@ -1,74 +1,175 @@
 # Built-ins
-import json
-import os
-import requests
 import time
+import uuid
+from collections import deque
+from dataclasses import dataclass
+from threading import Condition, Event, Lock
+from typing import Deque, Dict, Optional, Tuple, Any
 
 # Flask imports
 from flask import Flask, request
 from flask.json import jsonify
 
-
 app = Flask(__name__)
+
+# ----------------------------
+# Data model / shared state
+# ----------------------------
+
+@dataclass
+class LogRequest:
+    request_id: str
+    start_ts: float
+    end_ts: float
+    done: Event
+    result_logs: Optional[list] = None
+    error: Optional[str] = None
+
+
+# Queue for pending user /logs requests
+_pending: Deque[LogRequest] = deque()
+
+# In-flight request that has been handed to the camera but not yet answered
+_in_flight: Dict[str, LogRequest] = {}
+
+# Condition variable for coordinating /logs and /poll_for_command
+_cv = Condition(Lock())
+
+
+def _parse_timestamps() -> Tuple[float, float]:
+    """
+    Parse optional query params startTimestamp/endTimestamp.
+    If not provided, choose wide-enough numeric bounds (JSON doesn't support inf).
+    """
+    start_raw = request.args.get("startTimestamp")
+    end_raw = request.args.get("endTimestamp")
+
+    # Default: "all logs"
+    start_ts = 0.0
+    # 100 years into the future is "effectively infinite" for epoch timestamps.
+    end_ts = time.time() + 100 * 365 * 24 * 60 * 60
+
+    if start_raw is not None:
+        try:
+            start_ts = float(start_raw)
+        except ValueError:
+            raise ValueError("startTimestamp must be a float")
+
+    if end_raw is not None:
+        try:
+            end_ts = float(end_raw)
+        except ValueError:
+            raise ValueError("endTimestamp must be a float")
+
+    # Boundary sanity
+    if start_ts > end_ts:
+        raise ValueError("startTimestamp must be <= endTimestamp")
+
+    return start_ts, end_ts
 
 
 @app.route("/logs")
 def get_logs():
     """
-    The user calls this endpoint to fetch logs from the camera.
-
-    It can take the optional query parameters:
-      - startTimestamp: (float) Fetch logs with timestamp >= this parameter.
-      - endTimestamp: (float) Fetch logs with timestamp <= this parameter.
-
-    Response (JSON):
-    - logs: list of log objects, containing camera logs.
-
-    The response must have the "logs" field in the payload, but feel free
-    to add others if you need them.
+    User endpoint: enqueue a log request, wait for camera to respond via /send_logs,
+    then return the logs.
     """
-    start_timestamp = request.args.get("startTimestamp")
-    end_timestamp = request.args.get("endTimestamp")
-    resp_payload = {"logs": []}
-    # TODO: Write code here to set resp_payload.logs
-    return jsonify(resp_payload)
+    try:
+        start_ts, end_ts = _parse_timestamps()
+    except ValueError as e:
+        return jsonify({"error": str(e), "logs": []}), 400
 
+    lr = LogRequest(
+        request_id=str(uuid.uuid4()),
+        start_ts=start_ts,
+        end_ts=end_ts,
+        done=Event(),
+    )
 
-@app.route("/send_logs", methods=["POST"])
-def send_logs():
-    """
-    This endpoint is used by the camera to send logs back to the API.
+    # Enqueue request, notify any waiting camera poll
+    with _cv:
+        _pending.append(lr)
+        _cv.notify_all()
 
-    Request payload (JSON):
-    - logs: (array of log objects) the logs being sent from the camera.
+    # Wait for camera response
+    # Camera poll timeout is 60s; give ourselves a bit more time end-to-end.
+    ok = lr.done.wait(timeout=75)
 
-    The request must have the above fields in the payload, but feel free
-    to add others if you need them.
+    if not ok:
+        # Timed out waiting for camera.
+        # Clean up if still pending/in-flight.
+        with _cv:
+            # remove from pending if still there
+            try:
+                _pending.remove(lr)
+            except ValueError:
+                pass
+            _in_flight.pop(lr.request_id, None)
+        return jsonify({"error": "Timed out waiting for camera logs", "logs": []}), 504
 
-    Also feel free to add any fields to the response that you'd like.
-    """
-    req_payload = request.get_json()
-    logs = req_payload["logs"]
-    # TODO: Write code here to process logs
-    return jsonify({})
+    if lr.error:
+        return jsonify({"error": lr.error, "logs": []}), 500
+
+    return jsonify({"logs": lr.result_logs or [], "requestId": lr.request_id})
 
 
 @app.route("/poll_for_command")
 def poll_for_command():
     """
-    This is the endpoint that implements long polling. The camera calls this
-    endpoint to be notified when the api server wants event logs.
-    (i.e., when the api server gets a /logs GET request from the user).
-
-    Conceivably, it could be used to poll for other command besides "get logs",
-    but here we will only be implementing that command.
-
-    Feel free to structure the response payload however you see fit.
+    Camera endpoint: long-poll until there's a pending /logs request.
+    Returns either:
+      - {"command": "send_logs", "requestId": "...", "startTimestamp": ..., "endTimestamp": ...}
+      - {"command": "noop"}  (when no pending request before timeout)
     """
-    resp_payload = {}
-    # TODO: Write code here to correctly set resp_payload (the command returned to the camera)
-    return jsonify(resp_payload)
+    deadline = time.time() + 55  # keep < camera 60s timeout margin
+
+    with _cv:
+        while not _pending:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return jsonify({"command": "noop"})
+            _cv.wait(timeout=remaining)
+
+        lr = _pending.popleft()
+        _in_flight[lr.request_id] = lr
+
+    return jsonify(
+        {
+            "command": "send_logs",
+            "requestId": lr.request_id,
+            "startTimestamp": lr.start_ts,
+            "endTimestamp": lr.end_ts,
+        }
+    )
 
 
-if __name__ == '__main__':
-    app.run(debug=True, port=8080)
+@app.route("/send_logs", methods=["POST"])
+def send_logs():
+    """
+    Camera callback: send logs back for a specific requestId.
+    Payload:
+      - requestId: str
+      - logs: list
+    """
+    req_payload: Dict[str, Any] = request.get_json(silent=True) or {}
+    request_id = req_payload.get("requestId")
+    logs = req_payload.get("logs")
+
+    if not request_id or logs is None:
+        return jsonify({"error": "Missing requestId or logs"}), 400
+
+    with _cv:
+        lr = _in_flight.pop(request_id, None)
+
+    if lr is None:
+        # Could happen if /logs timed out and cleaned up
+        return jsonify({"status": "ignored", "reason": "unknown_or_expired_requestId"}), 200
+
+    lr.result_logs = logs
+    lr.done.set()
+    return jsonify({"status": "ok"}), 200
+
+
+if __name__ == "__main__":
+    # Important: threaded=True so /poll_for_command can block without starving others
+    app.run(host="0.0.0.0", debug=True, port=8080, threaded=True)
